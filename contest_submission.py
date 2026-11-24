@@ -87,21 +87,51 @@ def flatten(inputs):
     return paths, values
 
 
+def _schema_getter(paths):
+    """按冻结特征 schema 构造快速取值器（避免逐行递归展平与路径序列化，提速大样本集）。"""
+    steps = []
+    for raw in paths:
+        parts = json.loads(raw)
+        steps.append([(str(part[0]), part[1]) for part in parts])
+
+    def extract(inputs):
+        values = []
+        for path in steps:
+            value = inputs
+            for kind, key in path:
+                if kind == "key":
+                    if not isinstance(value, dict) or key not in value:
+                        raise ValueError("input feature missing")
+                    value = value[key]
+                else:
+                    if not isinstance(value, list) or not 0 <= key < len(value):
+                        raise ValueError("input feature missing")
+                    value = value[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("model inputs must contain finite numeric features only")
+            values.append(float(value))
+        return values
+
+    return extract
+
+
 def _read_rows(rows, task, classes, expected_paths):
     ids, features, targets = [], [], []
     seen = set()
     paths = expected_paths
+    getter = _schema_getter(paths) if paths is not None else None
     for row in rows:
         if not isinstance(row, dict) or not {"id", "inputs", "answer"} <= set(row):
             raise ValueError("id, inputs and answer are required")
         identity = row["id"]
         if not isinstance(identity, str) or not identity or identity in seen:
             raise ValueError("sample IDs must be nonempty and unique")
-        current_paths, values = flatten(row["inputs"])
-        if paths is None:
+        if getter is None:
+            current_paths, values = flatten(row["inputs"])
             paths = current_paths
-        if current_paths != paths:
-            raise ValueError("feature schema changed")
+            getter = _schema_getter(paths)
+        else:
+            values = getter(row["inputs"])
         answer = row["answer"]
         if task == "classification":
             if not isinstance(answer, str) or not classes or answer not in classes:
@@ -312,7 +342,7 @@ class Model:
 # ----------------------------------------------------------------------------
 
 def _evaluate(model, x, y, task):
-    """返回验证指标 dict。分类：macro-F1/accuracy；回归：RMSE/MAE。"""
+    """返回验证指标 dict。分类：macro-F1/accuracy；回归：RMSE/MAE/NASA 非对称评分。"""
     predictions = model.predict(x)
     if task == "classification":
         labels = np.argmax(predictions, axis=1)
@@ -325,8 +355,12 @@ def _evaluate(model, x, y, task):
             f1s.append(2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0)
         return {"macro_f1": float(np.mean(f1s)), "accuracy": float(np.mean(labels == y))}
     error = predictions - y
+    # NASA 非对称评分：预测偏早（误差为正）重罚，偏晚轻罚（RUL 标准口径）
+    scaled = np.clip(np.where(error > 0, error / 10.0, -error / 13.0), -50.0, 50.0)
+    nasa = float(np.sum(np.exp(scaled) - 1.0))
     return {"rmse": float(math.sqrt(np.mean(error ** 2))),
-            "mae": float(np.mean(np.abs(error)))}
+            "mae": float(np.mean(np.abs(error))),
+            "nasa_score": nasa}
 
 
 def _primary_metric(task, metrics):
@@ -336,10 +370,10 @@ def _primary_metric(task, metrics):
 
 
 def _better(task, candidate, parent):
-    """按指标方向比较两个指标 dict。"""
+    """严格更优判定（用于硬性止损：不更优就回滚，不允许任何容差）。"""
     if task == "classification":
-        return candidate["macro_f1"] > parent["macro_f1"]
-    return candidate["rmse"] < parent["rmse"]
+        return candidate["macro_f1"] > parent["macro_f1"] + 1e-9
+    return candidate["rmse"] < parent["rmse"] - 1e-9
 
 
 def _diagnose_drift(task, current, history_metrics):
@@ -367,30 +401,46 @@ def _diagnose_drift(task, current, history_metrics):
 
 
 def _budget_epochs(severity, round_index):
-    """创新点 6：成本收益自适应预算。漂移越重、轮次越靠后，投入越大，但受 2 核 CPU 限制。"""
-    base = 1
+    """创新点 6：成本收益自适应预算。轮内逐 epoch 搜索，上限随轮次加深（受 2 核 CPU 限制封顶 6）。"""
+    base = max(1, min(6, round_index))
     if severity >= 0.5:
         base += 2
     elif severity >= 0.2:
         base += 1
-    if round_index >= 7:
-        base += 1
-    return min(4, base)
+    return min(6, base)
 
 
 def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
-    """创新点 5：SafeGate 三重门槛（输入有限性 / 参数有限性 / 输出健康度）。"""
+    """创新点 5：SafeGate 三重门槛（输入有限性 / 参数有限性 / 指标健康度）。
+
+    硬性止损：候选验证指标必须严格优于父模型（分类 macro-F1 上升、回归 RMSE 下降），
+    回归任务还要求 NASA 非对称评分不显著恶化，否则一律回滚父模型。
+    """
     if not all(np.all(np.isfinite(p)) for p in model.params.values()):
         return False
     if not np.all(np.isfinite(x)):
         return False
     if task == "classification":
-        if candidate_metrics["macro_f1"] < parent_metrics["macro_f1"] - 0.05:
+        if candidate_metrics["macro_f1"] <= parent_metrics["macro_f1"] + 1e-9:
             return False
     else:
-        if candidate_metrics["rmse"] > parent_metrics["rmse"] * 1.25 + 5.0:
+        if candidate_metrics["rmse"] >= parent_metrics["rmse"] - 1e-9:
+            return False
+        if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * 1.1 + 1e-6:
             return False
     return True
+
+
+def _snapshot(model):
+    """冻结当前权重为可提交快照（轮内搜索需要保留轮内最佳）。"""
+    copy_model = Model.__new__(Model)
+    copy_model.meta = {**model.meta}
+    copy_model.params = {key: value.copy() for key, value in model.params.items()}
+    copy_model.first = {key: value.copy() for key, value in model.first.items()}
+    copy_model.second = {key: value.copy() for key, value in model.second.items()}
+    copy_model.mean, copy_model.scale = model.mean.copy(), model.scale.copy()
+    copy_model.validate()
+    return copy_model
 
 
 def _parameter_delta(parent, child):
@@ -495,56 +545,84 @@ def _train(rnd):
     state_dir = rnd.state_workspace(str(_WORKSPACE / "state"))
     state = _load_state(state_dir)
 
-    # 4) 监测：父模型当前验证指标 + 漂移诊断
-    parent_metrics = _evaluate(parent_model, x_val, y_val, task)
+    # 4) 监测：优先复用上轮记录的选中产物指标（省掉一次全量验证预测，降低 CPU 用时）
+    cached = state.get("selected_metrics")
+    required = {"macro_f1", "accuracy"} if task == "classification" else {"rmse", "mae"}
+    if isinstance(cached, dict) and required <= set(cached):
+        parent_metrics = {key: float(value) for key, value in cached.items()
+                          if isinstance(value, (int, float)) and not isinstance(value, bool)}
+        _log("parent metrics from state cache: %s" % json.dumps(parent_metrics))
+    else:
+        parent_metrics = _evaluate(parent_model, x_val, y_val, task)
     drift, severity = _diagnose_drift(task, parent_metrics, state["metric_history"])
     _log("parent metrics %s drift=%s severity=%.2f" % (json.dumps(parent_metrics), drift, severity))
 
-    # 5) 诊断 + 优化：预算调度决定本轮续训强度
-    epochs = _budget_epochs(severity, rnd.round_index)
-    _log("budget epochs=%d" % epochs)
+    # 5) 诊断 + 优化：预算调度决定本轮轮内 epoch 搜索上限
+    max_epochs = _budget_epochs(severity, rnd.round_index)
+    _log("budget max_epochs=%d" % max_epochs)
 
-    # 6) 做实验：从父检查点续训候选（预演版=先续训，再经 SafeGate 把关）
+    # 6) 做实验：轮内逐 epoch 续训并逐次验证，冻结轮内最佳（探索链不中断，但提交产物绝不倒退）
     candidate_model = Model.load(parent_ckpt)
-    losses = candidate_model.fit(x_train, y_train, epochs)
-    candidate_dir = _WORKSPACE / "candidate"
-    candidate_dir.mkdir(parents=True, exist_ok=False)
-    candidate_model.save(candidate_dir / "checkpoint.npz")
-    candidate_metrics = _evaluate(candidate_model, x_val, y_val, task)
-    gate_ok = _safe_gate(candidate_model, x_val, task, parent_metrics, candidate_metrics)
-    _log("candidate metrics %s gate=%s loss_last=%s" % (json.dumps(candidate_metrics), gate_ok, losses[-1] if losses else None))
+    losses = []
+    epoch_trail = []
+    best_model = None
+    best_metrics = None
+    best_epoch = 0
+    for epoch_step in range(1, max_epochs + 1):
+        losses.extend(candidate_model.fit(x_train, y_train, 1))
+        metrics = _evaluate(candidate_model, x_val, y_val, task)
+        epoch_trail.append({"epoch": epoch_step, "metrics": metrics})
+        if _better(task, metrics, parent_metrics) and (best_metrics is None or _better(task, metrics, best_metrics)):
+            best_model, best_metrics, best_epoch = _snapshot(candidate_model), metrics, epoch_step
+            _log("inner epoch %d new best: %s" % (epoch_step, json.dumps(metrics)))
+    epochs_run = len(epoch_trail)
+    if best_model is None:
+        _log("no inner epoch beat parent metrics; will submit parent copy")
+        candidate_dir = None
+        gate_ok = False
+    else:
+        candidate_dir = _WORKSPACE / "candidate"
+        candidate_dir.mkdir(parents=True, exist_ok=False)
+        best_model.save(candidate_dir / "checkpoint.npz")
+        gate_ok = _safe_gate(best_model, x_val, task, parent_metrics, best_metrics)
+    _log("inner search epochs=%d best_epoch=%d best=%s gate=%s"
+         % (epochs_run, best_epoch, json.dumps(best_metrics), gate_ok))
 
     # 7) 依据结果决策：真实大模型调用（每轮至少一次，且必须在本轮完成前）
     brief = (
         "智训引擎第 %d 轮（数据集 %s，任务 %s）。\n"
-        "父模型验证指标：%s\n续训 %d epoch 后候选验证指标：%s\n"
+        "父模型验证指标：%s\n轮内续训搜索 %d epoch，轮内最佳出现在第 %d epoch，最佳候选验证指标：%s\n"
         "漂移诊断：%s（严重度 %.2f），SafeGate：%s。\n"
-        "候选相对父模型%s。请只回复 promote（晋升候选封版）或 keep_parent（保留父模型）。"
-        % (rnd.round_index, dataset, task, json.dumps(parent_metrics), epochs,
-           json.dumps(candidate_metrics), drift, severity, "通过" if gate_ok else "未通过",
-           "更优" if _better(task, candidate_metrics, parent_metrics) else "未更优"))
+        "最佳候选相对父模型%s。请只回复 promote（晋升候选封版）或 keep_parent（保留父模型）。"
+        % (rnd.round_index, dataset, task, json.dumps(parent_metrics), epochs_run, best_epoch,
+           json.dumps(best_metrics), drift, severity, "通过" if gate_ok else "未通过",
+           "更优" if best_metrics is not None and _better(task, best_metrics, parent_metrics) else "未更优"))
     call_id, reply_text = _decide_with_llm(rnd, brief)
     _log("llm decision call=%s reply=%r" % (call_id, reply_text[:120]))
 
-    action = _parse_action(reply_text, task, candidate_metrics, parent_metrics)
+    action = _parse_action(reply_text, task, best_metrics if best_metrics is not None else parent_metrics, parent_metrics)
     if not gate_ok:
         action = "keep_parent"
         _log("SafeGate veto: keep_parent")
+    elif best_metrics is None or not _better(task, best_metrics, parent_metrics):
+        action = "keep_parent"
+        _log("candidate not strictly better than parent: force rollback (metrics outrank LLM advice)")
     else:
-        # 数字孪生预演思想落地：候选必须显著不劣才允许晋升
-        pass
+        if action != "promote":
+            _log("strict improvement found; LLM conservatism overridden, force promote")
+        action = "promote"
 
     # 8) 提交候选（keep 时也提交父检查点副本，保证选中产物一定是本轮合法产物）
     if action == "promote":
         submitted_dir = candidate_dir
-        selected_summary = candidate_metrics
-        continuation = {**parent_audit, "child_epochs": candidate_model.meta["epochs"],
-                        "child_steps": candidate_model.meta["steps"],
-                        **_parameter_delta(parent_model, candidate_model)}
-        change = ("从平台父检查点（%s…，epochs=%d，steps=%d）续训 %d epoch（预算调度），"
-                  "经 SafeGate 与漂移诊断通过，晋升封版。"
+        selected_summary = best_metrics
+        continuation = {**parent_audit, "child_epochs": best_model.meta["epochs"],
+                        "child_steps": best_model.meta["steps"],
+                        **_parameter_delta(parent_model, best_model)}
+        change = ("从平台父检查点（%s…，epochs=%d，steps=%d）轮内逐 epoch 续训 %d 轮、取第 %d epoch 的"
+                  "轮内最佳快照（预算上限 %d），经 SafeGate 与漂移诊断通过，晋升封版。"
                   % (rnd.parent.checkpoint_sha256[7:23], parent_model.meta["epochs"],
-                     parent_model.meta["steps"], epochs))
+                     parent_model.meta["steps"], epochs_run, best_epoch, max_epochs))
     else:
         keep_dir = _WORKSPACE / "keep"
         keep_dir.mkdir(parents=True, exist_ok=False)
@@ -554,25 +632,28 @@ def _train(rnd):
         continuation = {**parent_audit, "child_epochs": parent_model.meta["epochs"],
                         "child_steps": parent_model.meta["steps"],
                         **_parameter_delta(parent_model, parent_model)}
-        change = ("续训候选未通过 SafeGate 或大模型决策保留父模型，本轮回滚至父检查点（%s…，"
-                  "epochs=%d，steps=%d）。"
-                  % (rnd.parent.checkpoint_sha256[7:23], parent_model.meta["epochs"],
-                     parent_model.meta["steps"]))
+        change = ("轮内逐 epoch 续训 %d 轮（上限 %d）未找到严格优于父模型的快照，本轮回滚至父检查点（%s…，"
+                  "epochs=%d，steps=%d），避免性能倒退。"
+                  % (epochs_run, max_epochs, rnd.parent.checkpoint_sha256[7:23],
+                     parent_model.meta["epochs"], parent_model.meta["steps"]))
 
     seed = 42 + rnd.round_index
     hypothesis = ("基于平台父检查点 %s… 续训（父 epochs=%d/steps=%d）；本轮回环：监测%s（严重度 %.2f）"
-                  "→ 预算 %d epoch → SafeGate %s → 大模型决策 %s。"
+                  "→ 轮内 %d epoch 搜索（上限 %d，最佳第 %d epoch）→ SafeGate %s → 大模型决策 %s。"
                   % (rnd.parent.checkpoint_sha256[7:23], parent_model.meta["epochs"],
-                     parent_model.meta["steps"], drift, severity, epochs,
+                     parent_model.meta["steps"], drift, severity, epochs_run, max_epochs, best_epoch,
                      "通过" if gate_ok else "拦截", action))
     configuration = {
-        "epochs": epochs,
+        "epochs": epochs_run,
+        "max_epochs": max_epochs,
+        "best_epoch": best_epoch,
+        "epoch_trail": epoch_trail,
         "drift": drift,
         "severity": round(severity, 4),
         "gate_ok": gate_ok,
         "action": action,
         "parent_metrics": parent_metrics,
-        "candidate_metrics": candidate_metrics,
+        "candidate_metrics": best_metrics,
         "selected_metrics": selected_summary,
         "model_call_id": call_id,
         "loss_last": losses[-1] if losses else None,
@@ -592,8 +673,10 @@ def _train(rnd):
 
     # 9) 更新并保存跨轮状态
     state["metric_history"].append(parent_metrics)
+    state["selected_metrics"] = dict(selected_summary)
     state["drift_log"].append({"round": rnd.round_index, "drift": drift, "severity": severity, "action": action})
-    state["rounds"].append({"round": rnd.round_index, "epochs": epochs, "action": action})
+    state["rounds"].append({"round": rnd.round_index, "epochs": epochs_run, "max_epochs": max_epochs,
+                            "best_epoch": best_epoch, "action": action})
     state["metric_history"] = state["metric_history"][-10:]
     state["drift_log"] = state["drift_log"][-10:]
     state["rounds"] = state["rounds"][-10:]
