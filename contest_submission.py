@@ -587,16 +587,63 @@ def _train(rnd):
 _PREDICT_CACHE = {}
 
 
-def _load_predict_model(model_dir):
-    """懒加载 /model 下选中的检查点；按环境变量缓存。"""
-    key = os.environ.get("CONTEST_ARTIFACT_PATH") or str(Path(model_dir) / "checkpoint.npz")
-    if key not in _PREDICT_CACHE:
-        _PREDICT_CACHE[key] = Model.load(key)
-    return _PREDICT_CACHE[key]
+def _declared_checkpoint_paths(context):
+    """收集预测上下文与挂载清单里声明的检查点相对路径。"""
+    declared = []
+    if isinstance(context, dict):
+        artifact = context.get("artifact")
+        if isinstance(artifact, dict):
+            declared.extend(artifact.get("checkpoint_paths") or [])
+    raw = os.environ.get("CONTEST_ARTIFACT_MANIFEST", "")
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            item = payload.get("artifact")
+            if isinstance(item, dict):
+                declared.extend(item.get("checkpoint_paths") or [])
+            files = payload.get("files")
+            if isinstance(files, list):
+                declared.extend(entry.get("path") for entry in files if isinstance(entry, dict))
+    return [value for value in declared if isinstance(value, str) and value]
+
+
+def _resolve_checkpoint(model_dir, context):
+    """三级兜底定位选中的检查点：环境变量 → 清单声明 → 模型目录扫描。
+
+    平台把选中产物只读挂载到 /model 根目录，挂载点后直接拼固定文件名并不可靠，
+    因此必须按挂载目录里实际存在的文件来加载。
+    """
+    explicit = os.environ.get("CONTEST_ARTIFACT_PATH", "").strip()
+    if explicit:
+        candidate = Path(explicit)
+        if candidate.is_file():
+            return candidate
+    root = Path(model_dir)
+    if not root.is_dir():
+        raise ValueError("model directory is missing: %s" % root)
+    for relative in _declared_checkpoint_paths(context):
+        candidate = root / relative
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    found = sorted(path for path in root.rglob("*.npz") if path.is_file())
+    if found:
+        return found[0]
+    raise ValueError("no checkpoint file found under %s" % root)
 
 
 def predict(sample, model_dir):
-    model = _load_predict_model(model_dir)
+    checkpoint = _resolve_checkpoint(model_dir, getattr(sample, "context", None))
+    cache_key = str(checkpoint.resolve())
+    model = _PREDICT_CACHE.get(cache_key)
+    if model is None:
+        model = Model.load(checkpoint)
+        _PREDICT_CACHE[cache_key] = model
     if sample.task != model.meta["task"]:
         raise ValueError("prediction task mismatch")
     paths, values = flatten(sample.inputs)
