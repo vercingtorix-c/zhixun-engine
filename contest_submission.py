@@ -393,6 +393,16 @@ def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
     return True
 
 
+def _parameter_delta(parent, child):
+    """续训审计：权重相对变化量。远小于 1 说明是在父权重上微调续训，而非重新初始化。"""
+    parent_norm = math.sqrt(sum(float(np.sum(parent.params[key] ** 2)) for key in PARAMETERS))
+    delta_norm = math.sqrt(sum(float(np.sum((child.params[key] - parent.params[key]) ** 2))
+                               for key in PARAMETERS))
+    return {"parent_parameter_norm": round(parent_norm, 6),
+            "delta_parameter_norm": round(delta_norm, 6),
+            "relative_parameter_delta": round(delta_norm / max(parent_norm, 1e-12), 6)}
+
+
 # ----------------------------------------------------------------------------
 # 大模型决策（每轮必做一次真实调用；回复解析 + 保守兜底）
 # ----------------------------------------------------------------------------
@@ -463,6 +473,14 @@ def _train(rnd):
     parent_model = Model.load(parent_ckpt)
     classes = parent_model.meta["classes"]
     expected_paths = parent_model.meta["paths"]
+    parent_audit = {
+        "parent_checkpoint_sha256": rnd.parent.checkpoint_sha256,
+        "parent_epochs": parent_model.meta["epochs"],
+        "parent_steps": parent_model.meta["steps"],
+        "resumed_from_parent": True,
+    }
+    _log("parent checkpoint %s epochs=%d steps=%d"
+         % (rnd.parent.checkpoint_sha256[:24], parent_model.meta["epochs"], parent_model.meta["steps"]))
 
     # 1) 读公开数据（训练集只用于梯度；验证集用于测量与决策）
     x_train, y_train, _ = _read_rows(rnd.data.training_rows(), task, classes, expected_paths)
@@ -520,18 +538,33 @@ def _train(rnd):
     if action == "promote":
         submitted_dir = candidate_dir
         selected_summary = candidate_metrics
-        change = "从父检查点续训 %d epoch（预算调度），经 SafeGate 与漂移诊断通过，晋升封版。" % epochs
+        continuation = {**parent_audit, "child_epochs": candidate_model.meta["epochs"],
+                        "child_steps": candidate_model.meta["steps"],
+                        **_parameter_delta(parent_model, candidate_model)}
+        change = ("从平台父检查点（%s…，epochs=%d，steps=%d）续训 %d epoch（预算调度），"
+                  "经 SafeGate 与漂移诊断通过，晋升封版。"
+                  % (rnd.parent.checkpoint_sha256[7:23], parent_model.meta["epochs"],
+                     parent_model.meta["steps"], epochs))
     else:
         keep_dir = _WORKSPACE / "keep"
         keep_dir.mkdir(parents=True, exist_ok=False)
         parent_model.save(keep_dir / "checkpoint.npz")
         submitted_dir = keep_dir
         selected_summary = parent_metrics
-        change = "续训候选未通过 SafeGate 或大模型决策保留父模型，本轮回滚至父检查点。"
+        continuation = {**parent_audit, "child_epochs": parent_model.meta["epochs"],
+                        "child_steps": parent_model.meta["steps"],
+                        **_parameter_delta(parent_model, parent_model)}
+        change = ("续训候选未通过 SafeGate 或大模型决策保留父模型，本轮回滚至父检查点（%s…，"
+                  "epochs=%d，steps=%d）。"
+                  % (rnd.parent.checkpoint_sha256[7:23], parent_model.meta["epochs"],
+                     parent_model.meta["steps"]))
 
     seed = 42 + rnd.round_index
-    hypothesis = "五步闭环第 %d 轮：监测%s（严重度 %.2f）→ 预算 %d epoch 续训 → SafeGate %s → 大模型决策 %s。" % (
-        rnd.round_index, drift, severity, epochs, "通过" if gate_ok else "拦截", action)
+    hypothesis = ("基于平台父检查点 %s… 续训（父 epochs=%d/steps=%d）；本轮回环：监测%s（严重度 %.2f）"
+                  "→ 预算 %d epoch → SafeGate %s → 大模型决策 %s。"
+                  % (rnd.parent.checkpoint_sha256[7:23], parent_model.meta["epochs"],
+                     parent_model.meta["steps"], drift, severity, epochs,
+                     "通过" if gate_ok else "拦截", action))
     configuration = {
         "epochs": epochs,
         "drift": drift,
@@ -543,6 +576,7 @@ def _train(rnd):
         "selected_metrics": selected_summary,
         "model_call_id": call_id,
         "loss_last": losses[-1] if losses else None,
+        "continuation_audit": continuation,
     }
     submitted = rnd.submit_candidate(
         submitted_dir,
