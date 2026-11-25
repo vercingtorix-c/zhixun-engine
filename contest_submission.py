@@ -29,9 +29,12 @@ PARAMETERS = ("w1", "b1", "w2", "b2")
 FORMAT = "contest.cpu-mlp.v1"
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
 # 回归任务晋升安全边际：本地验证与平台评估存在系统性偏差（实测 0.2-0.4 RMSE），
-# 边界候选（本地微优、平台实际更差）会被误晋升，因此要求候选必须显著改善才允许封版。
+# 边界候选（本地微优、平台实际更差）会被误晋升，因此要求候选 RMSE 显著改善。
 REGRESSION_RMSE_MARGIN = 0.01
-REGRESSION_NASA_REQUIRED = 0.05
+# NASA 用"恶化容差"而非"必须改善"：B 的 NASA 在 1e24 量级、epoch 间波动仅 ±5%，
+# 要求改善 5% 会数学上锁死该数据集（实测最好 95.2%）；2% 容差既能放行 B 的正常训练，
+# 又能拦住 C 那种倍级恶化的坏候选（轮 9 实测 +145%）。
+REGRESSION_NASA_TOLERANCE = 0.02
 
 _THREADS = int(os.environ.get("BASELINE_CPU_THREADS", "2"))
 if not 1 <= _THREADS <= 8:
@@ -381,15 +384,15 @@ def _better(task, candidate, parent):
 
 
 def _better_risk(task, candidate, parent):
-    """风险约束下的更优判定：回归要求 RMSE 改善超过安全边际、且 NASA 显著改善。
+    """风险约束下的更优判定：回归要求 RMSE 改善超过安全边际、且 NASA 不显著恶化。
 
     本地验证与平台评估存在系统性偏差，边界候选会被误判为"更优"而在平台上倒退，
-    因此阈值必须留出余量（RMSE ≥1%、NASA ≥5%），宁可少晋升一轮也不让最差阶段倒退。
+    因此 RMSE 阈值留 1% 余量；NASA 采用 2% 恶化容差（指数放大的指标不适合要求持续改善）。
     """
     if task == "classification":
         return candidate["macro_f1"] > parent["macro_f1"] + 1e-9
     return (candidate["rmse"] <= parent["rmse"] * (1.0 - REGRESSION_RMSE_MARGIN)
-            and candidate["nasa_score"] <= parent["nasa_score"] * (1.0 - REGRESSION_NASA_REQUIRED))
+            and candidate["nasa_score"] <= parent["nasa_score"] * (1.0 + REGRESSION_NASA_TOLERANCE))
 
 
 def _diagnose_drift(task, current, history_metrics):
@@ -447,7 +450,7 @@ def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
     else:
         if candidate_metrics["rmse"] > parent_metrics["rmse"] * (1.0 - REGRESSION_RMSE_MARGIN):
             return False
-        if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * (1.0 - REGRESSION_NASA_REQUIRED):
+        if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * (1.0 + REGRESSION_NASA_TOLERANCE):
             return False
     return True
 
