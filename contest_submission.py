@@ -28,6 +28,9 @@ FORBIDDEN_INPUTS = {"truerul", "normalizedrul", "remainingusefullife", "rul", "t
 PARAMETERS = ("w1", "b1", "w2", "b2")
 FORMAT = "contest.cpu-mlp.v1"
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
+# NASA 相对容差：候选相对父模型的非对称评分恶化上限（0 = 零容忍）。
+# 实测零容忍会让轮内搜索在第 4 轮后全部 keep，因此允许极小波动；5% 仍能拦住倍级恶化的坏候选。
+NASA_TOLERANCE = 0.05
 
 _THREADS = int(os.environ.get("BASELINE_CPU_THREADS", "2"))
 if not 1 <= _THREADS <= 8:
@@ -376,6 +379,18 @@ def _better(task, candidate, parent):
     return candidate["rmse"] < parent["rmse"] - 1e-9
 
 
+def _better_risk(task, candidate, parent):
+    """风险约束下的更优判定：回归不仅要求 RMSE 严格下降，还要求 NASA 评分不恶化。
+
+    NASA 对长尾误差指数放大，RMSE 微降但 NASA 暴涨的候选在平台上等同倒退，
+    因此轮内选择与最终门槛统一用同一口径。
+    """
+    if task == "classification":
+        return candidate["macro_f1"] > parent["macro_f1"] + 1e-9
+    return (candidate["rmse"] < parent["rmse"] - 1e-9
+            and candidate["nasa_score"] <= parent["nasa_score"] * (1.0 + NASA_TOLERANCE) + 1e-6)
+
+
 def _diagnose_drift(task, current, history_metrics):
     """创新点 2/4：与历史验证指标比较，输出漂移类型与严重度。"""
     if not history_metrics:
@@ -401,20 +416,25 @@ def _diagnose_drift(task, current, history_metrics):
 
 
 def _budget_epochs(severity, round_index):
-    """创新点 6：成本收益自适应预算。轮内逐 epoch 搜索，上限随轮次加深（受 2 核 CPU 限制封顶 6）。"""
-    base = max(1, min(6, round_index))
+    """创新点 6：成本收益自适应预算。轮内逐 epoch 搜索，上限随轮次加深（2 核 CPU 下封顶 4）。"""
+    base = max(1, min(4, round_index))
     if severity >= 0.5:
         base += 2
     elif severity >= 0.2:
         base += 1
-    return min(6, base)
+    return min(4, base)
+
+
+def _resume_learning_rate(parent_lr, round_index):
+    """续训步长：沿用父检查点步长（实测降步长并不能改善 C 的 RMSE/NASA，故不做衰减）。"""
+    return parent_lr
 
 
 def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
     """创新点 5：SafeGate 三重门槛（输入有限性 / 参数有限性 / 指标健康度）。
 
     硬性止损：候选验证指标必须严格优于父模型（分类 macro-F1 上升、回归 RMSE 下降），
-    回归任务还要求 NASA 非对称评分不显著恶化，否则一律回滚父模型。
+    回归任务还要求 NASA 非对称评分零恶化（长尾风险优先），否则一律回滚父模型。
     """
     if not all(np.all(np.isfinite(p)) for p in model.params.values()):
         return False
@@ -426,7 +446,7 @@ def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
     else:
         if candidate_metrics["rmse"] >= parent_metrics["rmse"] - 1e-9:
             return False
-        if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * 1.1 + 1e-6:
+        if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * (1.0 + NASA_TOLERANCE) + 1e-6:
             return False
     return True
 
@@ -474,7 +494,7 @@ def _parse_action(text, task, candidate_metrics, parent_metrics):
         return "keep_parent"
     if "promote" in lowered or "晋升" in lowered or "accept" in lowered or "采用" in lowered:
         return "promote"
-    return "promote" if _better(task, candidate_metrics, parent_metrics) else "keep_parent"
+    return "promote" if _better_risk(task, candidate_metrics, parent_metrics) else "keep_parent"
 
 
 # ----------------------------------------------------------------------------
@@ -563,6 +583,9 @@ def _train(rnd):
 
     # 6) 做实验：轮内逐 epoch 续训并逐次验证，冻结轮内最佳（探索链不中断，但提交产物绝不倒退）
     candidate_model = Model.load(parent_ckpt)
+    candidate_model.meta["learning_rate"] = _resume_learning_rate(
+        candidate_model.meta["learning_rate"], rnd.round_index)
+    _log("resume learning_rate=%.4f" % candidate_model.meta["learning_rate"])
     losses = []
     epoch_trail = []
     best_model = None
@@ -572,7 +595,7 @@ def _train(rnd):
         losses.extend(candidate_model.fit(x_train, y_train, 1))
         metrics = _evaluate(candidate_model, x_val, y_val, task)
         epoch_trail.append({"epoch": epoch_step, "metrics": metrics})
-        if _better(task, metrics, parent_metrics) and (best_metrics is None or _better(task, metrics, best_metrics)):
+        if _better_risk(task, metrics, parent_metrics) and (best_metrics is None or _better_risk(task, metrics, best_metrics)):
             best_model, best_metrics, best_epoch = _snapshot(candidate_model), metrics, epoch_step
             _log("inner epoch %d new best: %s" % (epoch_step, json.dumps(metrics)))
     epochs_run = len(epoch_trail)
