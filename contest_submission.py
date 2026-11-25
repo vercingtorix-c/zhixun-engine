@@ -35,6 +35,9 @@ REGRESSION_RMSE_MARGIN = 0.01
 # 要求改善 5% 会数学上锁死该数据集（实测最好 95.2%）；2% 容差既能放行 B 的正常训练，
 # 又能拦住 C 那种倍级恶化的坏候选（轮 9 实测 +145%）。
 REGRESSION_NASA_TOLERANCE = 0.02
+# 只有当验证集样本量足够大时，RMSE 的估计才足够稳定、值得加安全边际；
+# 小样本（B 的 1679 行）逐轮估计噪声本身就大，再加边际会误伤末段真实收敛（B 末轮仅 0.25% 改善）。
+LARGE_VALIDATION_ROWS = 5000
 
 _THREADS = int(os.environ.get("BASELINE_CPU_THREADS", "2"))
 if not 1 <= _THREADS <= 8:
@@ -383,15 +386,18 @@ def _better(task, candidate, parent):
     return candidate["rmse"] < parent["rmse"] - 1e-9
 
 
-def _better_risk(task, candidate, parent):
+def _better_risk(task, candidate, parent, rmse_margin=None):
     """风险约束下的更优判定：回归要求 RMSE 改善超过安全边际、且 NASA 不显著恶化。
 
     本地验证与平台评估存在系统性偏差，边界候选会被误判为"更优"而在平台上倒退，
-    因此 RMSE 阈值留 1% 余量；NASA 采用 2% 恶化容差（指数放大的指标不适合要求持续改善）。
+    因此大验证集上 RMSE 阈值留 1% 余量；NASA 采用 2% 恶化容差（指数放大的指标不适合要求持续改善）。
+    小验证集由调用方传入 0 边际（噪声本身已构成保守约束）。
     """
+    if rmse_margin is None:
+        rmse_margin = REGRESSION_RMSE_MARGIN
     if task == "classification":
         return candidate["macro_f1"] > parent["macro_f1"] + 1e-9
-    return (candidate["rmse"] <= parent["rmse"] * (1.0 - REGRESSION_RMSE_MARGIN)
+    return (candidate["rmse"] <= parent["rmse"] * (1.0 - rmse_margin)
             and candidate["nasa_score"] <= parent["nasa_score"] * (1.0 + REGRESSION_NASA_TOLERANCE))
 
 
@@ -434,12 +440,14 @@ def _resume_learning_rate(parent_lr, round_index):
     return parent_lr
 
 
-def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
+def _safe_gate(model, x, task, parent_metrics, candidate_metrics, rmse_margin=None):
     """创新点 5：SafeGate 三重门槛（输入有限性 / 参数有限性 / 指标健康度）。
 
     硬性止损：候选验证指标必须严格优于父模型（分类 macro-F1 上升、回归 RMSE 下降），
     回归任务还要求 NASA 非对称评分零恶化（长尾风险优先），否则一律回滚父模型。
     """
+    if rmse_margin is None:
+        rmse_margin = REGRESSION_RMSE_MARGIN
     if not all(np.all(np.isfinite(p)) for p in model.params.values()):
         return False
     if not np.all(np.isfinite(x)):
@@ -448,7 +456,7 @@ def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
         if candidate_metrics["macro_f1"] <= parent_metrics["macro_f1"] + 1e-9:
             return False
     else:
-        if candidate_metrics["rmse"] > parent_metrics["rmse"] * (1.0 - REGRESSION_RMSE_MARGIN):
+        if candidate_metrics["rmse"] > parent_metrics["rmse"] * (1.0 - rmse_margin):
             return False
         if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * (1.0 + REGRESSION_NASA_TOLERANCE):
             return False
@@ -492,13 +500,13 @@ def _decide_with_llm(rnd, brief):
     return receipt.call_id, text
 
 
-def _parse_action(text, task, candidate_metrics, parent_metrics):
+def _parse_action(text, task, candidate_metrics, parent_metrics, rmse_margin=None):
     lowered = (text or "").lower()
     if "keep" in lowered or "保留" in lowered or "reject" in lowered or "拒绝" in lowered:
         return "keep_parent"
     if "promote" in lowered or "晋升" in lowered or "accept" in lowered or "采用" in lowered:
         return "promote"
-    return "promote" if _better_risk(task, candidate_metrics, parent_metrics) else "keep_parent"
+    return "promote" if _better_risk(task, candidate_metrics, parent_metrics, rmse_margin) else "keep_parent"
 
 
 # ----------------------------------------------------------------------------
@@ -583,7 +591,10 @@ def _train(rnd):
 
     # 5) 诊断 + 优化：预算调度决定本轮轮内 epoch 搜索上限
     max_epochs = _budget_epochs(severity, rnd.round_index)
-    _log("budget max_epochs=%d" % max_epochs)
+    # 安全边际按验证集规模自适应：样本足够大才用 1% 边际过滤边界候选，小样本保持 0
+    rmse_margin = REGRESSION_RMSE_MARGIN if len(x_val) >= LARGE_VALIDATION_ROWS else 0.0
+    _log("budget max_epochs=%d validation_rows=%d rmse_margin=%.3f"
+         % (max_epochs, len(x_val), rmse_margin))
 
     # 6) 做实验：轮内逐 epoch 续训并逐次验证，冻结轮内最佳（探索链不中断，但提交产物绝不倒退）
     candidate_model = Model.load(parent_ckpt)
@@ -599,7 +610,7 @@ def _train(rnd):
         losses.extend(candidate_model.fit(x_train, y_train, 1))
         metrics = _evaluate(candidate_model, x_val, y_val, task)
         epoch_trail.append({"epoch": epoch_step, "metrics": metrics})
-        if _better_risk(task, metrics, parent_metrics) and (best_metrics is None or _better(task, metrics, best_metrics)):
+        if _better_risk(task, metrics, parent_metrics, rmse_margin) and (best_metrics is None or _better(task, metrics, best_metrics)):
             best_model, best_metrics, best_epoch = _snapshot(candidate_model), metrics, epoch_step
             _log("inner epoch %d new best: %s" % (epoch_step, json.dumps(metrics)))
     epochs_run = len(epoch_trail)
@@ -611,7 +622,7 @@ def _train(rnd):
         candidate_dir = _WORKSPACE / "candidate"
         candidate_dir.mkdir(parents=True, exist_ok=False)
         best_model.save(candidate_dir / "checkpoint.npz")
-        gate_ok = _safe_gate(best_model, x_val, task, parent_metrics, best_metrics)
+        gate_ok = _safe_gate(best_model, x_val, task, parent_metrics, best_metrics, rmse_margin)
     _log("inner search epochs=%d best_epoch=%d best=%s gate=%s"
          % (epochs_run, best_epoch, json.dumps(best_metrics), gate_ok))
 
@@ -627,7 +638,7 @@ def _train(rnd):
     call_id, reply_text = _decide_with_llm(rnd, brief)
     _log("llm decision call=%s reply=%r" % (call_id, reply_text[:120]))
 
-    action = _parse_action(reply_text, task, best_metrics if best_metrics is not None else parent_metrics, parent_metrics)
+    action = _parse_action(reply_text, task, best_metrics if best_metrics is not None else parent_metrics, parent_metrics, rmse_margin)
     if not gate_ok:
         action = "keep_parent"
         _log("SafeGate veto: keep_parent")
