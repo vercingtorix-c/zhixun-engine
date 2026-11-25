@@ -28,9 +28,10 @@ FORBIDDEN_INPUTS = {"truerul", "normalizedrul", "remainingusefullife", "rul", "t
 PARAMETERS = ("w1", "b1", "w2", "b2")
 FORMAT = "contest.cpu-mlp.v1"
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
-# NASA 相对容差：候选相对父模型的非对称评分恶化上限（0 = 零容忍）。
-# 实测零容忍会让轮内搜索在第 4 轮后全部 keep，因此允许极小波动；5% 仍能拦住倍级恶化的坏候选。
-NASA_TOLERANCE = 0.05
+# 回归任务晋升安全边际：本地验证与平台评估存在系统性偏差（实测 0.2-0.4 RMSE），
+# 边界候选（本地微优、平台实际更差）会被误晋升，因此要求候选必须显著改善才允许封版。
+REGRESSION_RMSE_MARGIN = 0.01
+REGRESSION_NASA_REQUIRED = 0.05
 
 _THREADS = int(os.environ.get("BASELINE_CPU_THREADS", "2"))
 if not 1 <= _THREADS <= 8:
@@ -380,15 +381,15 @@ def _better(task, candidate, parent):
 
 
 def _better_risk(task, candidate, parent):
-    """风险约束下的更优判定：回归不仅要求 RMSE 严格下降，还要求 NASA 评分不恶化。
+    """风险约束下的更优判定：回归要求 RMSE 改善超过安全边际、且 NASA 显著改善。
 
-    NASA 对长尾误差指数放大，RMSE 微降但 NASA 暴涨的候选在平台上等同倒退，
-    因此轮内选择与最终门槛统一用同一口径。
+    本地验证与平台评估存在系统性偏差，边界候选会被误判为"更优"而在平台上倒退，
+    因此阈值必须留出余量（RMSE ≥1%、NASA ≥5%），宁可少晋升一轮也不让最差阶段倒退。
     """
     if task == "classification":
         return candidate["macro_f1"] > parent["macro_f1"] + 1e-9
-    return (candidate["rmse"] < parent["rmse"] - 1e-9
-            and candidate["nasa_score"] <= parent["nasa_score"] * (1.0 + NASA_TOLERANCE) + 1e-6)
+    return (candidate["rmse"] <= parent["rmse"] * (1.0 - REGRESSION_RMSE_MARGIN)
+            and candidate["nasa_score"] <= parent["nasa_score"] * (1.0 - REGRESSION_NASA_REQUIRED))
 
 
 def _diagnose_drift(task, current, history_metrics):
@@ -416,13 +417,13 @@ def _diagnose_drift(task, current, history_metrics):
 
 
 def _budget_epochs(severity, round_index):
-    """创新点 6：成本收益自适应预算。轮内逐 epoch 搜索，上限随轮次加深（2 核 CPU 下封顶 4）。"""
-    base = max(1, min(4, round_index))
+    """创新点 6：成本收益自适应预算。轮内逐 epoch 搜索，上限随轮次加深（B 需要 6 epoch 才能突破）。"""
+    base = max(1, min(6, round_index))
     if severity >= 0.5:
         base += 2
     elif severity >= 0.2:
         base += 1
-    return min(4, base)
+    return min(6, base)
 
 
 def _resume_learning_rate(parent_lr, round_index):
@@ -444,9 +445,9 @@ def _safe_gate(model, x, task, parent_metrics, candidate_metrics):
         if candidate_metrics["macro_f1"] <= parent_metrics["macro_f1"] + 1e-9:
             return False
     else:
-        if candidate_metrics["rmse"] >= parent_metrics["rmse"] - 1e-9:
+        if candidate_metrics["rmse"] > parent_metrics["rmse"] * (1.0 - REGRESSION_RMSE_MARGIN):
             return False
-        if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * (1.0 + NASA_TOLERANCE) + 1e-6:
+        if candidate_metrics["nasa_score"] > parent_metrics["nasa_score"] * (1.0 - REGRESSION_NASA_REQUIRED):
             return False
     return True
 
@@ -595,7 +596,7 @@ def _train(rnd):
         losses.extend(candidate_model.fit(x_train, y_train, 1))
         metrics = _evaluate(candidate_model, x_val, y_val, task)
         epoch_trail.append({"epoch": epoch_step, "metrics": metrics})
-        if _better_risk(task, metrics, parent_metrics) and (best_metrics is None or _better_risk(task, metrics, best_metrics)):
+        if _better_risk(task, metrics, parent_metrics) and (best_metrics is None or _better(task, metrics, best_metrics)):
             best_model, best_metrics, best_epoch = _snapshot(candidate_model), metrics, epoch_step
             _log("inner epoch %d new best: %s" % (epoch_step, json.dumps(metrics)))
     epochs_run = len(epoch_trail)
